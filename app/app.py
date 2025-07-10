@@ -1,19 +1,9 @@
 """
-Streamlit app: Rate‑Rise Strategy Evaluator
-Author: ChatGPT (o3)
-Date: 2025‑07‑08
+Streamlit app: Rate-Rise Strategy Evaluator
+Author: Chaordichris & ChatGPT (o3)
+Updated: 2025‑07‑10
 
-Purpose  ▸  Let users interactively size & stress‑test several "rates higher" trades:
-    • Short Treasury futures (TY, FV, UB)
-    • Long TLT put options (LEAPs)
-    • Kalshi (binary) contracts on Fed policy / 10‑Y yield
 
-Extensible: add more blocks (payer swaps, swaptions, curve spreads, etc.) by
-copy‑pasting the pattern of the existing Strategy classes.
-
-Requires:
-    streamlit
-    pandas, numpy, yfinance, plotly
 
 Run with:  streamlit run streamlit_rates_app.py
 """
@@ -30,23 +20,29 @@ st.set_page_config(page_title="Rates Strategy Evaluator", layout="wide")
 ###############################################################################
 # Utility helpers
 ###############################################################################
-CACHE_DAYS = 3  # re‑download prices if older than this many days
+CACHE_DAYS = 3  # re-download prices if older than this many days
 
 @st.cache_data(show_spinner=False, ttl=CACHE_DAYS * 24 * 60 * 60)
 def get_price_history(ticker: str, days_back: int = 365):
-    """Return historical close prices as Series."""
+    """Download *adjusted* price history and return as Series.
+    Falls back to raw Close if Adj Close is missing (futures & many indices)."""
     end = date.today()
     start = end - timedelta(days=days_back)
-    df = yf.download(ticker, start=start, end=end, progress=False)
+
+    # auto_adjust=True gives adjusted Close for equities; harmless for futures
+    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+
     if df.empty:
         st.warning(f"No data pulled for {ticker} – check symbol or yfinance availability.")
-    return df["Adj Close"].rename(ticker)
+        return pd.Series(dtype=float)
+
+    price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    return df[price_col].rename(ticker)
 
 ###############################################################################
 # Strategy classes – each must expose: description, inputs(), compute(), results_df
 ###############################################################################
 class ShortFuture:
-    """Short one of the main CBOT Treasury futures."""
     name = "Short Treasury Future"
 
     CONTRACTS = {
@@ -63,6 +59,10 @@ class ShortFuture:
     def compute(self):
         info = self.CONTRACTS[self.contract]
         self.hist = get_price_history(info["ticker"])
+        if self.hist.empty:
+            self.last_px = np.nan
+            self.dv01 = self.pnl = 0
+            return
         self.last_px = float(self.hist.iloc[-1])
         self.dv01 = info["dv01"] * self.lots
         self.pnl = self.dv01 * self.scn_bps
@@ -78,13 +78,15 @@ class ShortFuture:
         })
 
     def chart(self):
+        if self.hist.empty:
+            st.info("No price data to chart.")
+            return
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=self.hist.index, y=self.hist.values, name=self.contract))
         fig.update_layout(title=f"{self.contract} price history", xaxis_title="Date", yaxis_title="Price")
         st.plotly_chart(fig, use_container_width=True)
 
 class TltPut:
-    """Long a TLT LEAP put (simplified European payoff)."""
     name = "TLT Put Option"
 
     def inputs(self):
@@ -97,9 +99,13 @@ class TltPut:
 
     def compute(self):
         self.hist = get_price_history("TLT")
+        if self.hist.empty:
+            self.last_px = np.nan
+            self.payoff = 0
+            return
         self.last_px = float(self.hist.iloc[-1])
         intrinsic = max(0, self.strike - self.scn_price)
-        self.payoff = (intrinsic - self.premium) * self.contracts * 100  # 100 shares per option
+        self.payoff = (intrinsic - self.premium) * self.contracts * 100  # 100 shares/option
 
     def results_df(self):
         return pd.DataFrame({
@@ -112,17 +118,19 @@ class TltPut:
         })
 
     def chart(self):
+        if self.hist.empty:
+            st.info("No price data to chart.")
+            return
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=self.hist.index, y=self.hist.values, name="TLT"))
         fig.update_layout(title="TLT price history", xaxis_title="Date", yaxis_title="Price")
         st.plotly_chart(fig, use_container_width=True)
 
 class KalshiBinary:
-    """Binary contract priced 0–1; user inputs market price & payout condition."""
     name = "Kalshi Binary"
 
     def inputs(self):
-        self.question = st.text_input("Contract description", "Fed upper bound ≥ 5.00 % on Dec 2025 FOMC")
+        self.question = st.text_input("Contract description", "Fed upper bound ≥ 5.00 % on Dec 2025 FOMC")
         self.market_price = st.number_input("Market price (¢)", 1.0, 99.0, 38.0, step=0.5)
         self.notional = st.number_input("Contracts size ($1 payout)", 10, 10000, 100)
 
@@ -147,13 +155,9 @@ class KalshiBinary:
 ###############################################################################
 # Strategy registry and router
 ###############################################################################
-registry = {
-    ShortFuture.name: ShortFuture,
-    TltPut.name: TltPut,
-    KalshiBinary.name: KalshiBinary,
-}
+registry = {cls.name: cls for cls in (ShortFuture, TltPut, KalshiBinary)}
 
-st.title("📈  Rate‑Rise Strategy Evaluator")
+st.title("📈 Rate‑Rise Strategy Evaluator")
 st.markdown("Interactively size trades, pull live prices, and stress‑test P/L under yield scenarios. **Educational use only.**")
 
 with st.sidebar:
@@ -164,26 +168,22 @@ with st.sidebar:
 strategy = registry[choice]()
 strategy.inputs()
 
-run_btn = st.sidebar.button("Compute / Refresh", type="primary")
-
-if run_btn:
+if st.sidebar.button("Compute / Refresh", type="primary"):
     strategy.compute()
     res = strategy.results_df()
-    st.subheader("📑  Results")
-    st.dataframe(res, use_container_width=True, hide_index=True, height=200)
 
-    st.subheader("📊  Underlying Price History")
+    st.subheader("📑 Results")
+    st.dataframe(res, use_container_width=True, hide_index=True, height=220)
+
+    st.subheader("📊 Underlying Price History")
     strategy.chart()
 
-    st.caption("DV01 values are approximations. Option pricing uses intrinsic – replace with full Black pricing if desired.")
+    st.caption("DV01 values are approximations. Option pricing uses intrinsic – replace with full Black‑Scholes/76 if desired.")
 
-###############################################################################
-# Footer / disclaimers
-###############################################################################
-with st.expander("ℹ️  Disclaimers and Next Steps"):
-    st.write("""
-    •  This tool illustrates mechanics only and is **not** investment advice.
-    •  Prices pulled from free APIs (yfinance) may lag or adjust; confirm with your broker.
-    •  Extend by adding: payer swaptions (needs swap curve), curve spreads, or portfolio aggregation.
-    •  Replace the naïve option payoff with Black 76 pricing to include volatility & time‑value.
-    """)
+with st.expander("ℹ️ Disclaimers and Next Steps"):
+    st.markdown("""
+    • This tool illustrates mechanics only and is **not** investment advice.
+    • Prices pulled from free APIs (yfinance) may lag; confirm with your broker.
+    • Extend by adding: payer swaptions, curve spreads, or portfolio aggregation.
+    • Replace the naïve option payoff with Black‑76
+
